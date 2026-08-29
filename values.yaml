@@ -1,0 +1,102 @@
+# ADT OpenBao wrapper chart — default values.
+#
+# Two concerns live here:
+#   1. `bootstrap.*`      -- config for the auto-init/unseal Job this wrapper adds.
+#   2. `openbao.*`        -- values passed straight through to the upstream
+#                            OpenBao subchart (dependency name = "openbao").
+#
+# Environment overlays (adt-grc-gitops environments/openbao/<env>/values.yaml)
+# override the route host and anything else per-cluster.
+
+# --- Bootstrap Job (added by this wrapper) ---------------------------------
+bootstrap:
+  enabled: true
+  # In-cluster OpenShift CLI image (ships `oc`/`kubectl`, no pull secret needed).
+  image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+  # Name of the pinned Helm release / StatefulSet / pod-0 / service. Keep this
+  # in sync with the Argo CD Application `releaseName`.
+  releaseName: openbao
+  # Secret (created by the Job) that holds the single unseal key + root token.
+  keysSecretName: openbao-keys
+
+# --- Upstream OpenBao subchart ---------------------------------------------
+openbao:
+  global:
+    # Rely on OpenShift SCCs instead of the chart's hard-coded uid/fsGroup.
+    openshift: true
+
+  # OpenBao only for now — no Agent injector, no CSI provider.
+  injector:
+    enabled: false
+  csi:
+    enabled: false
+
+  ui:
+    enabled: true
+
+  server:
+    image:
+      repository: openbao/openbao-ubi
+
+    # No Kubernetes auth method yet, so skip the cluster-scoped
+    # system:auth-delegator ClusterRoleBinding. Keeps the AppProject's
+    # clusterResourceWhitelist to just Namespace, like the other services.
+    authDelegator:
+      enabled: false
+
+    # Single-node CRC: standalone with file storage on a PVC.
+    dataStorage:
+      enabled: true
+      size: 5Gi
+      storageClass: crc-csi-hostpath-provisioner
+      accessMode: ReadWriteOnce
+      mountPath: /openbao/data
+
+    standalone:
+      enabled: true
+      config: |
+        ui = true
+        listener "tcp" {
+          tls_disable = 1
+          address = "[::]:8200"
+        }
+        storage "file" {
+          path = "/openbao/data"
+        }
+
+    # Plain HTTP in-cluster; TLS is terminated at the OpenShift router (edge).
+    route:
+      enabled: true
+      host: ""            # set per-environment
+      tls:
+        termination: edge
+
+    # Self-unseal on restart. The openbao-keys Secret is mounted optionally so
+    # the pod still starts on first boot (before the bootstrap Job creates it);
+    # the hook no-ops when the key file is absent or the vault is already
+    # unsealed. First-time init + secret creation is done by the bootstrap Job.
+    volumes:
+      - name: openbao-keys
+        secret:
+          secretName: openbao-keys
+          optional: true
+    volumeMounts:
+      - name: openbao-keys
+        mountPath: /openbao/keys
+        readOnly: true
+    postStart:
+      - /bin/sh
+      - -c
+      - |
+        export BAO_ADDR=http://127.0.0.1:8200
+        key_file=/openbao/keys/unseal-key
+        [ -f "$key_file" ] || exit 0
+        i=0
+        while [ "$i" -lt 30 ]; do
+          if bao status -format=json >/dev/null 2>&1; then break; fi
+          i=$((i + 1)); sleep 2
+        done
+        if bao status -format=json 2>/dev/null | grep -q '"sealed"[: ]*true'; then
+          bao operator unseal "$(cat "$key_file")" || true
+        fi
+        exit 0

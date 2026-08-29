@@ -1,0 +1,89 @@
+{{- if .Values.bootstrap.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: openbao-bootstrap
+  labels:
+    app.kubernetes.io/name: openbao-bootstrap
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openbao-bootstrap
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: openbao-bootstrap
+      restartPolicy: Never
+      containers:
+        - name: bootstrap
+          image: {{ .Values.bootstrap.image | quote }}
+          env:
+            - name: POD
+              value: {{ printf "%s-0" .Values.bootstrap.releaseName | quote }}
+            - name: SECRET
+              value: {{ .Values.bootstrap.keysSecretName | quote }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -u
+              NS="$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace)"
+              echo "Bootstrapping OpenBao pod ${POD} in ${NS}"
+
+              bao() { oc -n "$NS" exec "$POD" -- sh -c "BAO_ADDR=http://127.0.0.1:8200 $1" 2>/dev/null; }
+
+              # Wait for the server pod to be Running (exec-able; it won't be
+              # Ready while sealed).
+              for i in $(seq 1 60); do
+                phase="$(oc -n "$NS" get pod "$POD" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+                [ "$phase" = "Running" ] && break
+                echo "waiting for ${POD} (phase=${phase:-none})..."; sleep 5
+              done
+
+              # Wait for the bao API to answer.
+              for i in $(seq 1 60); do
+                bao 'bao status' >/dev/null 2>&1 && break || true
+                st="$(bao 'bao status' || true)"
+                echo "$st" | grep -q 'Initialized' && break
+                echo "waiting for bao API..."; sleep 5
+              done
+
+              st="$(bao 'bao status' || true)"
+              initialized="$(echo "$st" | awk '/^Initialized/ {print $2}')"
+              sealed="$(echo "$st"      | awk '/^Sealed/ {print $2}')"
+              echo "status: initialized=${initialized} sealed=${sealed}"
+
+              if [ "$initialized" = "false" ]; then
+                echo "Initializing (1 share / 1 threshold)..."
+                out="$(bao 'bao operator init -key-shares=1 -key-threshold=1')"
+                key="$(echo "$out"   | awk '/^Unseal Key 1:/ {print $NF}')"
+                token="$(echo "$out" | awk '/^Initial Root Token:/ {print $NF}')"
+                if [ -z "$key" ] || [ -z "$token" ]; then
+                  echo "ERROR: failed to parse init output"; echo "$out"; exit 1
+                fi
+                echo "Storing keys in secret ${SECRET}"
+                oc -n "$NS" create secret generic "$SECRET" \
+                  --from-literal=unseal-key="$key" \
+                  --from-literal=root-token="$token" \
+                  --dry-run=client -o yaml | oc -n "$NS" apply -f -
+                echo "Unsealing..."
+                bao "bao operator unseal $key" >/dev/null || true
+              elif [ "$sealed" = "true" ]; then
+                echo "Already initialized but sealed; unsealing from secret ${SECRET}"
+                key="$(oc -n "$NS" get secret "$SECRET" -o jsonpath='{.data.unseal-key}' 2>/dev/null | base64 -d)"
+                if [ -n "$key" ]; then
+                  bao "bao operator unseal $key" >/dev/null || true
+                else
+                  echo "WARNING: no unseal key in secret; leaving sealed"
+                fi
+              else
+                echo "Already initialized and unsealed; nothing to do."
+              fi
+
+              st="$(bao 'bao status' || true)"
+              echo "$st" | awk '/^Initialized/ || /^Sealed/ {print}'
+              echo "$st" | grep -q '^Sealed[[:space:]]*false' || { echo "ERROR: still sealed"; exit 1; }
+              echo "OpenBao is initialized and unsealed."
+{{- end }}

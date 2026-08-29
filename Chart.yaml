@@ -1,0 +1,15 @@
+apiVersion: v2
+name: openbao
+description: >-
+  ADT OpenBao wrapper chart. Wraps the upstream OpenBao chart in standalone /
+  file-storage mode for the single-node CRC cluster, and adds an auto-init +
+  self-unseal bootstrap Job (unseal key + root token stored in a Kubernetes
+  Secret) plus an OpenShift Route. Mirrors the step-ca-helm wrapper pattern.
+type: application
+version: 0.1.0
+appVersion: "2.6.2"
+
+dependencies:
+  - name: openbao
+    version: "0.29.3"
+    repository: "https://openbao.github.io/openbao-helm"
