@@ -11,8 +11,11 @@
 # --- Bootstrap Job (added by this wrapper) ---------------------------------
 bootstrap:
   enabled: true
-  # In-cluster OpenShift CLI image (ships `oc`/`kubectl`, no pull secret needed).
-  image: image-registry.openshift-image-registry.svc:5000/openshift/cli:latest
+  # Public image shipping kubectl (+ curl/jq). The in-cluster registry
+  # (image-registry.openshift-image-registry.svc:5000) is not reachable from the
+  # node's image-pull path on this CRC cluster, so use a Docker Hub image (which
+  # the cluster can pull, same as the runner's python image).
+  image: docker.io/alpine/k8s:1.33.13
   # Name of the pinned Helm release / StatefulSet / pod-0 / service. Keep this
   # in sync with the Argo CD Application `releaseName`.
   releaseName: openbao
