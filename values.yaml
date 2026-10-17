@@ -22,6 +22,45 @@ bootstrap:
   # Secret (created by the Job) that holds the single unseal key + root token.
   keysSecretName: openbao-keys
 
+# --- Plugin staging (added by this wrapper) --------------------------------
+# OpenBao secrets/auth plugins are external binaries that must live on-disk in
+# the server's `plugin_directory`. This wrapper provisions a dedicated PVC for
+# them and a one-shot Job that fetches each binary from a GHES release asset,
+# verifies its SHA-256, and drops it on the PVC (mode 0755). The server mounts
+# the same PVC read-only at `plugin_directory` (set in the standalone config
+# below). No plugin binary ever ships inside the image.
+#
+# Enabled by default: this wrapper exists to host the keyless-build Quay secrets
+# engine. The server volume/volumeMount below reference `pvcName`, so if you
+# ever set `enabled: false` you must also drop those two entries in an overlay.
+plugins:
+  enabled: true
+  pvcName: openbao-plugins
+  mountPath: /openbao/plugins
+  # Image used by the one-shot fetch Job — ships curl + sha256sum. Same public
+  # image the bootstrap Job uses (the node can pull Docker Hub).
+  image: docker.io/alpine/k8s:1.33.13
+  pvc:
+    size: 1Gi
+    storageClass: crc-csi-hostpath-provisioner
+    accessMode: ReadWriteOnce
+  # Secret (key: `token`) holding a GHES token that can read the release assets
+  # below. Created out-of-band; only needed while the Job populates the PVC, so
+  # it can be deleted once the plugins are staged.
+  fetchTokenSecret: openbao-plugin-fetch-token
+  # ConfigMap (key: `ca.crt`) with the CA that signs the GHES host, so the Job
+  # verifies TLS to adt-git01 (no -k, token never crosses an unverified channel).
+  # Created out-of-band by copying the ARC runner's GHES CA cert.
+  caBundleConfigMap: openbao-plugin-ghes-ca
+  # Each item is fetched to <mountPath>/<name>, SHA-256-verified, chmod 0755.
+  #   name   -- plugin command (binary filename; the OpenBao catalog -command)
+  #   url    -- GHES release-asset API URL (fetched with Accept: octet-stream)
+  #   sha256 -- hex digest; the Job and the OpenBao catalog must agree on this
+  items: []
+    # - name: openbao-plugin-secrets-quay
+    #   url: https://adt-git01.adt.network/api/v3/repos/<owner>/<repo>/releases/assets/<id>
+    #   sha256: <hex>
+
 # --- Upstream OpenBao subchart ---------------------------------------------
 openbao:
   global:
@@ -59,6 +98,7 @@ openbao:
       enabled: true
       config: |
         ui = true
+        plugin_directory = "/openbao/plugins"
         listener "tcp" {
           tls_disable = 1
           address = "[::]:8200"
@@ -83,9 +123,18 @@ openbao:
         secret:
           secretName: openbao-keys
           optional: true
+      # Plugin binaries, staged onto a PVC by the plugins fetch Job (see
+      # templates/plugins.yaml). Mounted read-only; path matches
+      # `plugin_directory` in the standalone config above.
+      - name: openbao-plugins
+        persistentVolumeClaim:
+          claimName: openbao-plugins
     volumeMounts:
       - name: openbao-keys
         mountPath: /openbao/keys
+        readOnly: true
+      - name: openbao-plugins
+        mountPath: /openbao/plugins
         readOnly: true
     postStart:
       - /bin/sh

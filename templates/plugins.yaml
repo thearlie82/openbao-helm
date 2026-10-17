@@ -1,0 +1,112 @@
+{{- if .Values.plugins.enabled }}
+# Dedicated PVC that hosts the OpenBao external plugin binaries. The server
+# StatefulSet mounts this read-only at `plugin_directory` (see values.yaml
+# server.volumeMounts); the fetch Job below mounts it read-write once to stage
+# the binaries. No plugin binary ships inside any image.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Values.plugins.pvcName }}
+  labels:
+    app.kubernetes.io/name: openbao-plugins
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  accessModes:
+    - {{ .Values.plugins.pvc.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.plugins.pvc.size }}
+  storageClassName: {{ .Values.plugins.pvc.storageClass }}
+{{- if .Values.plugins.items }}
+---
+# One-shot Job that fetches each plugin binary from its GHES release asset,
+# verifies the pinned SHA-256, and drops it on the PVC (mode 0755). The Job name
+# carries a hash of `plugins.items`, so changing the item set spawns a fresh Job
+# (Job specs are immutable) and Argo prunes the superseded one. Idempotent: an
+# already-staged binary with a matching digest is left untouched.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "openbao-plugins-fetch-%s" (.Values.plugins.items | toJson | sha256sum | trunc 10) }}
+  labels:
+    app.kubernetes.io/name: openbao-plugins-fetch
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  backoffLimit: 6
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openbao-plugins-fetch
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      restartPolicy: Never
+      volumes:
+        - name: plugins
+          persistentVolumeClaim:
+            claimName: {{ .Values.plugins.pvcName }}
+        - name: ghes-ca
+          configMap:
+            name: {{ .Values.plugins.caBundleConfigMap }}
+        - name: token
+          secret:
+            secretName: {{ .Values.plugins.fetchTokenSecret }}
+      containers:
+        - name: fetch
+          image: {{ .Values.plugins.image | quote }}
+          env:
+            - name: CURL_CA_BUNDLE
+              value: /etc/ghes-ca/ca.crt
+            - name: DEST
+              value: {{ .Values.plugins.mountPath | quote }}
+          volumeMounts:
+            - name: plugins
+              mountPath: {{ .Values.plugins.mountPath }}
+            - name: ghes-ca
+              mountPath: /etc/ghes-ca
+              readOnly: true
+            - name: token
+              mountPath: /etc/ghes-token
+              readOnly: true
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              # Token goes into a 0600 curl config (-K), never onto curl's argv
+              # (/proc is world-readable). Only the asset URL rides the argv.
+              cfg="$(mktemp)"
+              trap 'rm -f "$cfg"' EXIT
+              chmod 600 "$cfg"
+              {
+                printf 'header = "Authorization: token %s"\n' "$(cat /etc/ghes-token/token)"
+                printf 'header = "Accept: application/octet-stream"\n'
+              } > "$cfg"
+
+              stage() {
+                name="$1"; url="$2"; want="$3"
+                dest="${DEST}/${name}"
+                if [ -f "$dest" ] && [ "$(sha256sum "$dest" | awk '{print $1}')" = "$want" ]; then
+                  echo "[$name] already staged with matching sha256; skip"
+                  return 0
+                fi
+                echo "[$name] fetching ${url}"
+                tmp="$(mktemp "${DEST}/.${name}.XXXXXX")"
+                curl -fsSL -K "$cfg" "$url" -o "$tmp"
+                got="$(sha256sum "$tmp" | awk '{print $1}')"
+                if [ "$got" != "$want" ]; then
+                  echo "[$name] sha256 MISMATCH got=$got want=$want"
+                  rm -f "$tmp"
+                  exit 1
+                fi
+                chmod 0755 "$tmp"
+                mv -f "$tmp" "$dest"
+                echo "[$name] staged OK (sha256=$got)"
+              }
+
+              {{- range .Values.plugins.items }}
+              stage {{ .name | quote }} {{ .url | quote }} {{ .sha256 | quote }}
+              {{- end }}
+              echo "--- plugin_directory contents ---"
+              ls -l "${DEST}"
+{{- end }}
+{{- end }}
